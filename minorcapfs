@@ -1,0 +1,343 @@
+#!/usr/bin/perl 
+#MinorFs POLP/POLA proof of concept filesystem kit
+#Copyright (C) Rob J Meijer 2008  <minorfs@polacanthus.net>
+#
+#This library is free software; you can redistribute it and/or
+#modify it under the terms of the GNU Lesser General Public
+#License as published by the Free Software Foundation; either
+#version 2.1 of the License, or (at your option) any later version.
+#
+#This library is distributed in the hope that it will be useful,
+#but WITHOUT ANY WARRANTY; without even the implied warranty of
+#MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+#Lesser General Public License for more details.
+#
+#You should have received a copy of the GNU Lesser General Public
+#License along with this library; if not, write to the Free Software
+#Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307  USA
+
+use strict;
+use Proc::DaemonLite qw(:all);
+use Unix::Mknod qw(:all);
+unless (open(GROUP,"/etc/group")) {
+  print STDERR "ERROR: Can not open /etc/group file, aborting install\n";
+  exit 1;
+}
+my $minorgroup="minorfs";
+while (<GROUP>) {
+  if (/^fuse:x:\d+:/) {
+     $minorgroup="fuse";
+  }
+}
+close(GROUP);
+print "minorcapfs going into background, consult syslog for information\n";
+init_server(undef,"capfs",$minorgroup);
+open(STDOUT,">/dev/null");
+open(STDERR,">/dev/null");
+use Fuse qw(fuse_get_context);
+use IO::File;
+use POSIX qw(ENOENT ENOSYS EEXIST EPERM O_RDONLY O_RDWR O_APPEND O_CREAT);
+use Fcntl qw(S_ISBLK S_ISCHR S_ISFIFO SEEK_SET);
+use Digest::SHA1;
+use DBI;
+our $VARDIR="/var/minorfs";
+our $MOUNTROOT="/mnt/minorfs";
+my $dbpath="$VARDIR/capfs/rwcap.db";
+our $DBH=DBI->connect("dbi:SQLite:dbname=$dbpath","","")|| log_die("Unable to connect to db: $dbpath $DBI::errstr"); 
+
+sub getsecret {
+ my $SEC;
+ unless ( sysopen(SECRET,"${VARDIR}/capfs/secret",O_RDONLY) ) {
+   log_die("minorfscap can not be run without a secret ${VARDIR}/capfs/secret");
+   exit 1;
+ }
+ sysread(SECRET,$SEC,1024);
+ close(SECRET); 
+ return $SEC;
+}
+
+my $SECRET=&getsecret();
+
+sub addcaptodb {
+  my ($passcap,$file)=@_;
+  $file=$DBH->quote($file);
+  my $query="insert into passcaps (passcap,path) VALUES('$passcap',$file)";
+  my $sth=$DBH->prepare( $query );
+  $sth->execute();
+  $sth->finish;
+}
+sub resolvecap {
+  my ($passcap)=@_;
+  my $query="select path from passcaps where passcap='$passcap'";
+  my $sth=$DBH->prepare( $query );
+  $sth->execute();
+  my $path = "";
+  $sth->bind_columns(undef,\$path);
+  $sth->fetch();
+  $sth->finish;
+  return $path
+}
+sub removepwcap {
+  my ($file)=@_;
+  $file=$DBH->quote($file);
+  my $query="delete from passcaps where path = $file";
+  my $sth=$DBH->prepare( $query );
+  $sth->execute();
+  $sth->finish;
+};
+
+
+sub getpwcap {
+  my ($file)=@_;
+  my $sha1 = Digest::SHA1->new;
+  $sha1->add($file);
+  $sha1->add($SECRET);
+  my($digest)= $sha1->hexdigest;
+  return $digest;
+}
+
+sub makepwcap{ 
+   my ($new) = @_;
+   my ($pwcap) = getpwcap($new);
+   &addcaptodb($pwcap,$new);
+   return;   
+}
+
+sub getfullpwcap {
+   my ($file) = @_;
+   my ($pwcap) = getpwcap($file);
+   &addcaptodb($pwcap,$file); # FIXME: need to document why we do this here.
+   return "${MOUNTROOT}/cap/$pwcap";
+}
+
+sub getcntlpwcap {
+   my ($file) = @_;
+   my ($pwcap) = getpwcap($file);
+   return "${MOUNTROOT}/ctkr/cap/$pwcap";
+}
+
+sub fixup {
+            my ($path) = @_;
+            if ($path eq "/") {
+              return "${VARDIR}/stub/";
+            }
+            $path =~ s/^\///g;
+            my ($passcap,$subpath)=split(/\//,$path,2);
+            if ($passcap =~ /^(\w+)$/) {
+              my $realpath=&resolvecap($passcap);
+              if ($realpath) {
+                if ($subpath =~ /\w+/) {
+                  return $realpath . "/" . $subpath;
+                }
+                return $realpath;
+              }
+            }
+            return "${VARDIR}/bogus/";;
+}
+
+sub x_getattr {
+	my ($file) = fixup(shift);
+	my (@list) = lstat($file);
+	return -$! unless @list;
+        my $dmode=$list[2] & 0700;
+        $dmode /= 64;
+        $dmode *= 9;
+        $list[2] |= $dmode;
+	return @list;
+}
+
+sub x_getdir {
+        my ($path)=@_;
+        if ($path eq "/") {
+          return("..",".",0);
+        }
+	my ($dirname) = fixup($path);
+	unless(opendir(DIRHANDLE,$dirname)) {
+		return -ENOENT();
+	}
+	my (@files) = readdir(DIRHANDLE);
+	closedir(DIRHANDLE);
+	return (@files, 0);
+}
+
+sub x_open {
+	my ($file) = fixup(shift);
+	my ($mode) = shift;
+	return -$! unless sysopen(FILE,$file,$mode);
+	close(FILE);
+        makepwcap($file);
+	return 0;
+}
+
+sub x_read {
+	my ($file,$bufsize,$off) = @_;
+	my ($rv) = -ENOSYS();
+	my ($handle) = new IO::File;
+	return -ENOENT() unless -e ($file = fixup($file));
+	my ($fsize) = -s $file;
+	return -ENOSYS() unless open($handle,$file);
+	if(seek($handle,$off,SEEK_SET)) {
+		read($handle,$rv,$bufsize);
+	}
+	return $rv;
+}
+
+sub x_write {
+	my ($file,$buf,$off) = @_;
+	my ($rv);
+	return -ENOENT() unless -e ($file = fixup($file));
+	my ($fsize) = -s $file;
+	return -ENOSYS() unless open(FILE,'+<',$file);
+	if($rv = seek(FILE,$off,SEEK_SET)) {
+		$rv = print(FILE $buf);
+	}
+	$rv = -ENOSYS() unless $rv;
+	close(FILE);
+	return length($buf);
+}
+
+sub err {
+   return (-shift || -$!) 
+}
+
+sub x_readlink { 
+  return readlink(fixup(shift));
+}
+
+sub x_listxattr { 
+  return ("user.cap","user.cntl",0);
+}
+
+sub x_getxattr {
+  my ($file,$attname) =@_;
+  if ($attname eq "user.cap") {
+    if ($file =~ /^\/?(\w+)$/) {
+     return "${MOUNTROOT}/cap/$1";
+    }
+    my $fixup=fixup($file);
+    my $pwcap=getfullpwcap($fixup);
+    return $pwcap;
+  }
+  elsif ($attname eq "user.cntl") {
+    if ($file =~ /^\/?(\w+)$/) {
+     return "${MOUNTROOT}/ctkr/cap/$1";
+    }
+    my $fixup=fixup($file);
+    my $pwcap=getcntlpwcap($fixup);
+    return $pwcap;
+  }
+  return 0;
+}
+
+
+sub x_unlink   { 
+   my ($file) = fixup(shift);
+   my $rval= unlink($file) ? 0 : -$!;
+   if ($rval == 0) {
+     removepwcap($file);
+   } 
+   return $rval;
+}
+
+sub x_symlink {
+   my ($target,$source)=@_;
+   unless  ($target =~ /^\/mnt\/minorfs\//) {
+      return -EPERM();
+   }
+   return symlink($target,fixup($source)) ? 0 : -$!;
+}
+
+sub x_rename {
+	my ($old) = fixup(shift);
+	my ($new) = fixup(shift);
+	my ($err) = rename($old,$new) ? 0 : -ENOENT();
+        if ($err == 0) {
+          makepwcap($new);
+          removepwcap($old);
+        }
+	return $err;
+}
+
+sub x_link {
+   return -EPERM(); 
+}
+
+sub x_chown {
+        return -EPERM();
+}
+sub x_chmod {
+        return -EPERM();
+}
+sub x_truncate { 
+   return truncate(fixup(shift),shift) ? 0 : -$! ; 
+}
+sub x_utime {
+  return utime($_[1],$_[2],fixup($_[0])) ? 0:-$!; 
+}
+
+sub x_mkdir { 
+         my ($name, $perm) = @_; 
+         my  $file=fixup($name);
+         if (mkdir($file,0700)) {
+           makepwcap($file);
+           return 0;
+         } 
+         return -$!; 
+
+}
+sub x_rmdir { 
+         my $file=fixup(shift);
+         if (rmdir $file ) {
+           removepwcap($file);
+           return 0;
+         }
+         return -$!; 
+}
+
+sub x_mknod {
+	my ($file, $modes, $dev) = @_;
+	$file = fixup($file);
+	$! = 0;
+        mknod($file,0600,$dev);
+        my $rval= - $!;
+        makepwcap($file);
+	return $rval;
+}
+
+# kludge
+sub x_statfs {return 255,1000000,500000,1000000,500000,4096}
+mkdir("${MOUNTROOT}/cap",0755);
+mkdir("${MOUNTROOT}/stub",0111);
+eval {
+  Fuse::main(
+	mountpoint=>"${MOUNTROOT}/cap/",
+	getattr =>"main::x_getattr",
+	readlink=>"main::x_readlink",
+	getdir  =>"main::x_getdir",
+	mknod   =>"main::x_mknod",
+	mkdir   =>"main::x_mkdir",
+	unlink  =>"main::x_unlink",
+	rmdir   =>"main::x_rmdir",
+	symlink =>"main::x_symlink",
+	rename  =>"main::x_rename",
+	link    =>"main::x_link",
+	chmod   =>"main::x_chmod",
+	chown   =>"main::x_chown",
+	truncate=>"main::x_truncate",
+	utime   =>"main::x_utime",
+	open    =>"main::x_open",
+	read    =>"main::x_read",
+	write   =>"main::x_write",
+	listxattr=>"main::x_listxattr",
+	getxattr=>"main::x_getxattr",
+	statfs  =>"main::x_statfs",
+	threaded=>0,
+	debug => 0,
+	mountopts => "allow_other",
+  );
+};
+if ($@) {
+  log_notice("Problem in Fuse::main"); 
+  log_notice("user: $< $> ; group $( $)");
+  log_notice("Probably a problem accesing /dev/fuse");
+}

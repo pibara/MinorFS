@@ -1,0 +1,23 @@
+#!/bin/sh
+FUSERMOUNT_BIN=/usr/bin/fusermount
+test -x $FUSERMOUNT_BIN || FUSERMOUNT_BIN=/bin/fusermount 
+test -x $FUSERMOUNT_BIN || exit 5
+case "$1" in
+    start)
+    	echo "Starting MinorFs filesystems"
+	/sbin/modprobe fuse
+	/usr/bin/perl /usr/local/bin/minorcapfs;
+        sleep 5;
+        /usr/bin/perl /usr/local/bin/minorviewfs;
+	;;
+    stop)
+	echo "Shutting down MinorFs filesystems"
+        $FUSERMOUNT_BIN -u /mnt/minorfs/cap ;
+        $FUSERMOUNT_BIN -u /mnt/minorfs/priv;
+	;;
+    *)
+	echo "Usage: $0 {start|stop}"
+	exit 1
+	;;
+esac
+

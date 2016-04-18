@@ -1,0 +1,56 @@
+To install and use pleas do the folowing:
+
+* Make sure that you have fuse installed, and that the fuse kernel module is 
+  loaded at startup. 
+
+* Make sure that you have Fuse.pm installed with a version not lower than 0.09.
+
+* Make sure you have the following perl modules installed
+   + Digest::SHA1
+   + XML::DOM
+   + File::ExtAttr
+   + User::pwent
+   + Unix::GroupFile 
+   + Proc::DaemonLite
+   + Unix::Mknod
+
+* Make sure you have the gnu c compiler (gcc) installed.
+
+* As root run the script install.pl
+
+* Start the filesystems by as root invoking:
+
+     /etc/init.d/minorfs start
+
+* Test minorviewfs by (as any user) calling:
+
+     cp /etc/issue /home/minorfs/virtual
+     ls /home/minorfs/virtual
+     cp /home/minorfs/virtual/issue .
+     ls
+
+  This test shows that cp and ls under minorviewfs have distinct
+  and private views under /home/minorfs/virtual.
+
+* For testing that minorcapfs and minorviewfs work together, do
+  the folowing:
+
+     make test
+     ./test
+
+  You should be abel to list the result from ./test, and see how
+  minorfs makes use of extended attribute to make private data
+  delegatable. 
+
+* If needed, stop minorfs
+
+    /etc/init.d/minorfs stop
+
+Please note, /etc/init.d/minorfs in the current alpha does seem to work from the
+commandline, but doesn't seem to work correctly with the runlevel editor,
+thus the current version seems to require manual starting and stopping.
+
+If you run into any problems, or discover any bugs (or have any tips on how to get
+/etc/init.d/minorfs working with the runlevel editor), please report them
+to minorfs@polacanthus.net .
+

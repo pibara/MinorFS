@@ -1,0 +1,31 @@
+This text describes the roadmap set out for MinorFs.
+
+0.4
+* complete capctkrfs (caretaker fs, a simple caretaker and membrane based filesystem for implementing attenuation and revocation)
+
+0.5
+* create caprofs (read only filesystem, a simple wrapper pattern fs for capctkrfs)
+* add better and more apparmor profiles.
+* add iptables rules.	
+* add more tests
+* add more documentation
+
+0.6
+* create caprocfs (revoke on close), a filesystem that allows a file descriptor close to be used as revokation of a ctkrfs delegated node.
+
+0.7
+* create capcowfs (copy on write), a rw filesystem on top of ro nodes where wtitten to files are coppied (in full) at the first writeing action.
+
+0.8
+* More tests, lots of testing.
+* Documentation of dependencies.
+* Packaging for AppArmor based linux distro suse 
+* Packaging for AppArmor based ubuntu.
+
+0.9
+* anything needed to get MinorFs to work well with and if possible as part of the AppArmor 3.x distribution.
+
+1.0
+* Hopefully there will not be a 1.0, if there will be one this means attempts to make MinorFs part of the AppArmor distro failed.
+
+

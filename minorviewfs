@@ -1,0 +1,456 @@
+#!/usr/bin/perl -w
+#MinorFs POLP/POLA proof of concept filesystem kit
+#Copyright (C) Rob J Meijer 2008  <minorfs@polacanthus.net>
+#
+#This library is free software; you can redistribute it and/or
+#modify it under the terms of the GNU Lesser General Public
+#License as published by the Free Software Foundation; either
+#version 2.1 of the License, or (at your option) any later version.
+#
+#This library is distributed in the hope that it will be useful,
+#but WITHOUT ANY WARRANTY; without even the implied warranty of
+#MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+#Lesser General Public License for more details.
+#
+#You should have received a copy of the GNU Lesser General Public
+#License along with this library; if not, write to the Free Software
+#Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307  USA
+
+use strict;
+use XML::DOM;
+use File::ExtAttr ':all';
+
+#MinorViewFs uses a MinorCapFs directory node as its data root.
+#Given that MinorCapFs works with strong paths as password caps,
+#this path is stored in $VARDIR/viewfs.startcap and readable
+#only to root (the user MinorViewFs needs to run under).
+sub getbasecap {
+ my ($VARDIR) = @_;
+ unless (open(BASECAP,"$VARDIR/viewfs.startcap")) {
+    print STDERR "$VARDIR/viewfs.startcap does not exist , use setup script to create.\n";
+    exit 1;
+  }
+  my $basepath = <BASECAP>;
+  $basepath =~ s/\r//g;
+  chomp($basepath);
+  unless (-d $basepath) {
+     print STDERR "The path specified in $VARDIR/viewfs.startcap is not a valid base dir for minorviewfs\n";
+     exit 1;
+  }
+  if (-d "$basepath/tmp") {
+       &deldir("$basepath/tmp");
+  }
+  return $basepath;
+}
+
+sub checkroot{
+  unless ($> == 0) {
+     print STDERR "minorviewfs should be run as root in order to have sufficient rights on /proc\n";
+    exit 1;
+  }
+}
+
+#By default MinorViewFs assumes enviroment variables don't change program
+#behaviour, and neither do commandline arguments. It also allocates a default
+#of 16 instance slots for instances running in paralel.
+#The xml config files allow to specify other values for these 3 parameters.
+sub readconfig {
+  my ($CONFDIR) =@_; 
+  my %rval;
+  unless (opendir(CONFDIR,$CONFDIR)) {
+    print STDERR "$CONFDIR directory does not exist\n";
+    exit 1;
+  }
+  my @direntries=readdir(CONFDIR);
+  closedir(CONFDIR);
+  my $parser = new XML::DOM::Parser;
+  foreach my $file (@direntries) {
+    if ($file =~ /\.xml$/) {
+       my $doc = $parser->parsefile ("$CONFDIR/$file");
+       my $nodes = $doc->getElementsByTagName ("codefile");
+       my $n = $nodes->getLength;
+       for (my $i = 0; $i < $n; $i++)
+       {
+            my $node = $nodes->item ($i);
+            my $codefile = $node->getAttributeNode("path")->getNodeValue();
+            $rval{$codefile} = {};
+            my $ucattr=$node->getAttributeNode ("cmdline");
+            my $usecmdline = 0;
+            if ($ucattr) {
+              $usecmdline = $ucattr->getNodeValue();
+            };
+            my $slotattr=$node->getAttributeNode("slots");
+            my $slotcount=0;
+            if ($slotattr) {
+              $slotcount=$slotattr->getNodeValue();
+            }
+            if ($usecmdline ne "true") { $usecmdline=0;} else {$usecmdline = 1;}
+            unless ($slotcount) {$slotcount=0;}
+            $rval{$codefile}{"usecmd"}=$usecmdline;
+            $rval{$codefile}{"slots"}=$slotcount;
+            my $nodes2 = $node->getElementsByTagName("env");
+            my $n2 = $nodes2->getLength;
+            my @envlist=();
+            for (my $i2 = 0; $i2 < $n2; $i2++) {
+                my $node2=$nodes2->item($i2);
+                my $env=$node2->getFirstChild()->toString();
+                push(@envlist,$env);
+            }
+            $rval{$codefile}{"envvars"} = [@envlist];
+       }
+    }
+  }
+  return %rval;
+}
+
+use Proc::DaemonLite qw(:all);
+&checkroot();
+our %CONFIG = &readconfig("/etc/minorfs");
+our $BASEPATH = &getbasecap("/var/minorfs");
+our %CACHE ;
+print "minorviewfs going into background, consult syslog for information\n";
+init_server();
+open(STDOUT,">/dev/null");
+open(STDERR,">/dev/null");
+
+
+use Fuse qw(fuse_get_context);
+use POSIX qw(ENOENT ENOSYS EINVAL EEXIST EPERM O_RDONLY O_RDWR O_APPEND O_CREAT);
+use Fcntl qw(S_ISBLK S_ISCHR S_ISFIFO SEEK_SET);
+use Digest::SHA1;
+our %INSTANCECLAIMED;
+
+#Recursively delete a directory.
+sub deldir {
+  my ($dir) = @_;
+  opendir(D1,$dir) || log_warn("Problem opening dir '$dir'");
+  my @entries =readdir(D1);
+  closedir(D1);
+  foreach my $entry (@entries) {
+    unless (($entry eq "..") || ($entry eq "."))
+    {
+       if (-d "$dir/$entry") {
+         &deldir("$dir/$entry");
+       } else {
+         unlink("$dir/$entry");
+       }
+    }
+  }
+  rmdir($dir); 
+}
+
+#Fetch the binary code files specified in /proc/$PID/maps for each
+#of the process its parents.
+sub getparentsmap {
+  my ($pid) = @_;
+  my @rval;
+  my $ancestorcount=0;
+  while ($pid != 1) {
+    $ancestorcount++;
+    my $ppid =0;
+    open(STATUS,"/proc/$pid/status");
+    while(<STATUS>) {
+      if (/^PPid:\s+(\d+)/i) {
+         $ppid= $1;
+      }
+    }
+    close(STATUS);
+    unless ($ppid) {
+      return @rval;
+    }
+    my @parentmap=&getmap($ppid);
+    foreach my $parentfile (sort @parentmap) {
+      push(@rval,"${ancestorcount}::$parentfile");
+    }
+    $pid=$ppid;
+  }
+  return @rval;
+}
+
+
+#The /proc/$pid/maps file contains a list of all executable and library
+#files loaded to form the running program. /proc/$pid/attr/current contains
+#aditional info on the AppArmor profile the program runs under.
+#If two instances of the same program run under different AppArmor profiles,
+#MinorViewFs considders them two different programs.
+
+sub getmap {
+  my ($pid) = @_;
+  my @rval=();
+  my $istorulethemall=0;
+  open(APPARMORINFO,"/proc/$pid/attr/current");
+  my $line=<APPARMORINFO>;
+  $line =~ s/\r//g;
+  chomp($line);
+  push(@rval,"AppArmor::$line");
+  close(APPARMORINFO);
+  open(MAPS,"/proc/$pid/maps");
+  while (<MAPS>) {
+   if (/x\w\s+\S.*\s(\/\w.*)$/) {
+     push(@rval,$1);
+     if ($1 eq "/usr/local/bin/2rulethemall") {
+       $istorulethemall=1;
+     }
+   }
+  }
+  close(MAPS);
+  if ($istorulethemall) {
+     return "RuleThemAll";
+  }
+  return sort @rval;
+}
+
+#The /proc/$pid/cmdline file contains the commandline information with what the
+#running program was invoked. This information may be relevant for identifying 
+#uniquely behaving instances of the same program as such. By default MinorViewFs
+#does not use the commandline info unless explicitly specified in the config.
+sub getcmdline {
+  my ($pid) = @_;
+  my @rval=();
+  open(CMDLINE,"/proc/$pid/cmdline");
+  my $line=<CMDLINE>;
+  close(CMDLINE);
+  chomp($line);
+  $line =~  s/\0/ /g;
+  $line =~ s/[<>"'&;]/?/g;
+  return $line;
+}
+
+#The /proc/$pid/environ file contains all enviroment setting for a running process.
+#By default MinorViewFs ignores all enviroment variables. 
+#The config can however specify specific enviroment variables for an executable that
+#change it behaviour in such a way that MinorFs should interpret instances of the
+#same program running with different values of this variable to be different programs.
+sub getenvdata {
+  my ($pid,@envnames) = @_;
+  my %namemap;
+  foreach my $name (@envnames) {
+    $namemap{$name}=1;
+  }
+  my @rval=();
+  open(ENV,"/usr/bin/strings /proc/$pid/environ|");
+  while(<ENV>) {
+    chomp;
+    my ($key,$val)=split(/=/);
+    if ($namemap{$key}) {
+      push(@rval,$_);
+    }
+  }
+  return sort @rval;
+}
+
+sub getenvlist {
+  my ($exe,$config)= @_;
+  my $recref = $config->{$exe};
+  if ($recref) {
+    my $envref = $recref->{"envvars"};
+    if ($envref) {
+      return sort (@{$envref});
+    }
+  }
+  return;
+}
+
+#This function tries to create an XML representation of the relevant identifying 
+#variables that make an executable unique.
+sub getexemeta {
+  my ($pid,$config) = @_;
+  my @map=&getmap($pid);
+  if ($map[0] eq "RuleThemAll") {
+    return "<RuleThemAll/>";
+  }
+  my @parentmap=&getparentsmap($pid);
+  my $nocmd=1;
+  my %envfilter;
+  my $slots=0;
+  my $hasconf=0;
+  my $xml = "<prog>\n  <codefiles>\n";
+  foreach my $binary (@map) {
+      $xml .= "    <file>$binary</file>\n";
+      my $confrec = $config->{$binary};
+      if ($confrec) {
+         $hasconf=1;
+         if ($confrec->{"usecmd"}) {
+           $nocmd=0;
+         }
+         my $slotsbin=$confrec->{"slots"};
+         if ($slotsbin) {
+           $slots= $slotsbin;
+         }
+      }
+      my @envlist=&getenvlist($binary,$config);
+      foreach my $envvar (@envlist) {
+        $envfilter{$envvar}=1;
+      }
+  } 
+  $xml .= "  </codefiles>\n";
+  unless ($nocmd) {
+    my $cmdline=&getcmdline($pid);
+    $xml .= "  <cmdline>$cmdline</cmdline>\n";
+  }
+  $xml .= "  <enviroment>\n";
+  my @envdata=&getenvdata($pid,keys %envfilter);
+  foreach my $envvar (@envdata) {
+      $xml .= "    <var>$envvar</var>\n";
+  }
+  $xml .= "  </enviroment>\n";
+  $xml .= "  <parentmap>\n";
+  foreach my $binary (@parentmap) {
+     $xml .= "    <file>$binary</file>\n";
+  }
+  $xml .= "  </parentmap>\n";
+  $xml .= "</prog>\n";
+  return $xml,$slots;
+}
+
+#This function is the core routine of the MinorViewFs filesystem.
+sub getprocinfo {
+  my ($pid,$uid,$basepath,$config,$cache) = @_;
+  #if cached, return cached process info.
+  my $cacheddata=$cache->{$pid};
+  if ($cacheddata) {
+    return %{$cacheddata};
+  }
+  #otherwise, gather the information needed from conf and /proc.
+  my %rval;
+  my $slots=0;
+  $rval{"uid"}=$uid;
+  #get the number of slots and the xml representation for the executable instance.
+  ($rval{"xml"},$slots) = &getexemeta($pid,$config);
+  if ($slots == 0) {$slots = 16;}
+  #Create a unique identifyer for the executable by taking the sha1 of the xml.
+  my $sha1 = Digest::SHA1->new;
+  $sha1->add($rval{"xml"});
+  my $digest=$rval{"digest"}=$sha1->hexdigest;
+  #Claim the first free instance slot.
+  my $instance=$rval{"instance"}=&getinstanceno($rval{"digest"},$pid,$uid,$slots,$cache);
+  #Create directories if needed.
+  my $rawhomepath;
+  if ($rval{"xml"} eq "<RuleThemAll/>") {
+    $rawhomepath=$basepath . "/home/" . $uid;
+    mkdir("$basepath/home",0700);
+    mkdir("$basepath/home/$uid",0700);
+  } else {
+    $rawhomepath=$basepath . "/home/" . $uid . "/" . $digest . "/inst" . $instance;
+    mkdir("$basepath/home",0700);
+    mkdir("$basepath/home/$uid",0700);
+    mkdir("$basepath/home/$uid/$digest",0700);
+    mkdir("$basepath/home/$uid/$digest/inst$instance",0700);
+  }
+  #Create the xml file for use by the user.
+  open(META,">$basepath/home/$uid/$digest/meta.xml")|| log_warn("Problem opening $basepath/home/$uid/$digest/meta.xml $? $!");
+  print META $rval{"xml"};
+  close(META);
+  #Create the temporary tmp dir for the new process.
+  mkdir("$basepath/tmp",0700);
+  mkdir("$basepath/tmp/$uid",0700);
+  mkdir("$basepath/tmp/$uid/$pid",0700);
+  my $rawtmppath=$basepath . "/tmp/" . $uid . "/" . $pid ;
+  #Ask MinorCapFs for the proper rw caps to the two private directories.
+  $rval{"homecap"} = getfattr($rawhomepath, 'cap');
+  $rval{"tmpcap"} = getfattr($rawtmppath, 'cap'); 
+  $rval{"rawtmp"} = $rawtmppath;
+  $cache->{$pid} = { %rval };
+  return %rval;
+}
+
+#Cleanup the temporary directories for any process no longer running.
+sub cleanup {
+  my ($cache) = @_;
+  opendir(PROC,"/proc");
+  my @subdirs=readdir(PROC);
+  closedir(PROC);
+  my %active;
+  foreach my $subdir (@subdirs) {
+    if ($subdir =~ /^\d+$/) {
+       $active{$subdir}=1;
+    }
+  }
+  my @oldpids=keys %$cache;
+  my $actcount=0;
+  my $deadcount=0;
+  foreach my $instancepid (@oldpids) {
+    unless ($active{$instancepid}) {
+      $deadcount++;
+      my $procinfo = $cache->{$instancepid};
+      my $tmpdir=$procinfo->{"rawtmp"};
+      &deldir($tmpdir);  
+      my $exe=$procinfo->{"digest"};
+      my $instancenum = $procinfo->{"instance"};
+      my $uid=$procinfo->{"uid"};
+      delete($INSTANCECLAIMED{"${uid}:${exe}:$instancenum"});
+      delete($cache->{$instancepid});
+    } else {
+      $actcount++;
+    }
+  }
+}
+
+#Claim the first free instance slot.
+sub getinstanceno {
+  my ($exe,$pid,$uid,$slots,$cache)=@_; 
+  &cleanup($cache);
+  foreach my $instancenum (1 .. $slots) {
+    unless ($INSTANCECLAIMED{"${uid}:${exe}:$instancenum"}) {
+            $INSTANCECLAIMED{"${uid}:${exe}:$instancenum"}=$pid;
+            return $instancenum;
+    }
+  }
+  return 0;
+}
+
+sub filename_fixup {
+	my ($file) = shift;
+	$file =~ s,^/,,;
+	$file = '.' unless length($file);
+	return $file;
+}
+
+sub e_getattr {
+	my ($file) = filename_fixup(shift);
+	$file =~ s,^/,,;
+	$file = '.' unless length($file);
+        my ($dev, $ino, $rdev, $blocks, $gid, $uid, $nlink, $blksize,$atime, $ctime, $mtime,$size) = (0,0,0,1,0,0,1,1024,0,0,0,0);
+        my ($modes);
+        if ($file eq ".") {
+           $modes=0040555;
+        } elsif ($file eq "home") {
+           $modes=0120777;
+        } elsif ($file eq "tmp") {
+           $modes=0120777;
+        } else {
+	  return -ENOENT();
+        }
+        return ($dev,$ino,$modes,$nlink,$uid,$gid,$rdev,$size,$atime,$mtime,$ctime,$blksize,$blocks);
+}
+
+sub e_getdir {
+        return (".","home","tmp",0);
+}
+
+sub e_readlink {
+        my ($file) = filename_fixup(shift);
+        my $context = fuse_get_context();
+        my ($pid,$uid)=@$context{'pid','uid'};
+        my %procinfo = &getprocinfo($pid,$uid,$BASEPATH,\%CONFIG,\%CACHE);
+        if ($file eq "home") {
+          my $homecap=$procinfo{"homecap"};
+          return $homecap;
+        } elsif ($file eq "tmp") {
+          my $tmpcap=$procinfo{"tmpcap"};
+          return $tmpcap;
+        }
+        return -ENOENT();
+}
+
+sub e_statfs { return 255, 1, 1, 1, 1, 2 }
+
+Fuse::main(
+	mountpoint=>"/mnt/minorfs/priv",
+	getattr=>"main::e_getattr",
+	getdir =>"main::e_getdir",
+        readlink=>"main::e_readlink", 
+	statfs =>"main::e_statfs",
+	threaded=>0,
+        mountopts => "allow_other",
+);
